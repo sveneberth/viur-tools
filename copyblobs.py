@@ -1,10 +1,19 @@
-import sqlite3
-import pickle
-import urllib2
-from urllib import quote_plus
-from time import time, sleep
-import pickle, json, random, mimetypes, string, sys, os
+import Queue
 import argparse
+import json
+import logging
+import mimetypes
+import pickle
+import random
+import string
+import sys
+import threading
+import time
+import urllib2
+
+from termcolor import *
+
+logging.basicConfig(format="%(levelname)-8s %(asctime)s %(filename)s:%(lineno)s - %(message)s", level=logging.DEBUG)
 
 parser = argparse.ArgumentParser(description='Copies the complete Blob-Store from the given application to the destination Application.')
 parser.add_argument('--srcappid', type=str, help='Appspot-ID of the src Application.', required=True, dest="srcappid")
@@ -127,7 +136,7 @@ def haveBlob( blobKey ):
 
 		if blobdbfile:
 			blobdbfile.write("%s\n" % blobKey)
-		
+
 	return answ
 
 def fetchBlob( blobKey ):
@@ -186,23 +195,68 @@ dstNetworkService = NetworkService(viurDstHost)
 
 #Fetch blobs
 res = srcNetworkService.request("/dbtransfer/exportBlob2",
-			{"key": srcBackupKey})
+								{"key": srcBackupKey})
+
+q = Queue.Queue(maxsize=100)
+
+
+def StoreWorker(q):
+	sleepTime = 1
+	t = threading.currentThread()
+	while getattr(t, "work", True):
+		try:
+			blob = q.get(timeout=1)
+			cprint("Store %r" % blob, "magenta")
+			storeBlob(blob["key"], fetchBlob(blob["key"]), blob["content_type"])
+			q.task_done()
+			sleepTime = 1
+
+		except Queue.Empty:
+			cprint("Queue is empty. Sleep %s seconds" % sleepTime, "magenta")
+			time.sleep(sleepTime)
+			# if sleepTime <= 16:
+			# 	sleepTime *= 2
+
+threads = []
+
+for _ in range(8):
+	t = threading.Thread(target=StoreWorker, args=(q,))
+	t.setDaemon(True)
+	t.start()
+	threads.append(t)
 
 numBlobs = 0
 while res["values"]:
-	numBlobs += len( res["values"] )
-	print("Got a total of %s blobs so far" % numBlobs )
+	numBlobs += len(res["values"])
+	cprint("Got a total of %s blobs so far" % numBlobs, "cyan")
 	newBlobs = 0
 	for r in res["values"]:
-		if override or not haveBlob( r["key"] ):
-			print("Fetching new blobkey %s" % r["key"] )
-			if r["content_type"] == "application/pdf":
-				print("- Ignoring: %r" % r["content_type"])
+		if override or not haveBlob(r["key"]):
+			print("Fetching new blobkey %s" % r["key"])
+			if r["content_type"] in {"application/pdf", "text/csv", "application/octet-stream"}:
+				print(colored("- Ignoring: %r" % r["content_type"], "yellow"))
 				continue
 
-			storeBlob( r["key"], fetchBlob( r["key"] ), r["content_type"] )
+			# while q.qsize() > 100:
+			# 	print (colored("Sleep, Queue is full enough.", "yellow"))
+			# 	time.sleep(10)
+
+			q.put(r)
+
+			# threading.Thread(target=storeBlob, args=( r["key"], fetchBlob( r["key"] ), r["content_type"] )).start()
+			# storeBlob( r["key"], fetchBlob( r["key"] ), r["content_type"] )
+
 			newBlobs += 1
-	print("%s of the last batch of %s where new" % (newBlobs, len(res["values"])))
-	res = srcNetworkService.request("/dbtransfer/exportBlob2", {"cursor":res["cursor"], "key": srcBackupKey})
+	cprint("%s of the last batch of %s where new" % (newBlobs, len(res["values"])), "cyan")
+	cprint("Cursor: %s" % res["cursor"], "red")
+	res = srcNetworkService.request("/dbtransfer/exportBlob2", {"cursor": res["cursor"], "key": srcBackupKey})
+
+q.join()
+
+for t in threads:
+	t.work = False
+
+for t in threads:
+	t.join()
 
 print("Finished copying %d files" % numBlobs)
